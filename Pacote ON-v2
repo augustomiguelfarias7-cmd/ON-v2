@@ -1,0 +1,678 @@
+# train_on_full.py
+# -------------------------------------------------------------
+# ON v2 (compact) + VAE + Diffusion (skeleton)
+# Mantém listas de datasets; adiciona VAE + UNet diffusion pipeline.
+# -------------------------------------------------------------
+
+import os
+import math
+import random
+import argparse
+from typing import List, Iterator, Optional, Tuple, Dict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+from tokenizers import Tokenizer, models, pre_tokenizers, trainers, normalizers
+from datasets import load_dataset
+
+from PIL import Image
+from torchvision import transforms
+import torchaudio
+
+# ----------------------------
+# CONFIG PADRÃO
+# ----------------------------
+DEFAULT_VOCAB_SIZE = 2_000_000
+DEFAULT_MAX_SEQ = 2048
+DEFAULT_EMBED = 1024
+DEFAULT_LAYERS = 12
+DEFAULT_HEADS = 16
+DEFAULT_BATCH = 2
+CHECKPOINT_DIR = "checkpoints_on"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ----------------------------
+# 15 DATASETS SUGERIDOS (MANTIDOS)
+# ----------------------------
+DATASET_IDS_TEXT = [
+    "wikipedia",
+    "openwebtext",
+    "bookcorpus",
+    "pile",
+    "cc_news",
+    "wikitext",
+    "arxiv",
+    "pubmed",
+    "europarl",
+    "open_subtitles",
+]
+
+DATASET_IDS_IMAGE = [
+    "coco",
+    "openimages",
+    "image_corpus_placeholder"
+]
+
+DATASET_IDS_AUDIO = [
+    "mozilla-foundation/common_voice",
+    "voxpopuli",
+    "speech_commands"
+]
+
+# ----------------------------
+# Tokenizer (BPE) - wrapper simples
+# ----------------------------
+class ONTokenizerWrapper:
+    def __init__(self, vocab_size:int=DEFAULT_VOCAB_SIZE, path_out: str = "on_tokenizer.json"):
+        self.vocab_size = vocab_size
+        self.path_out = path_out
+        self.tokenizer = Tokenizer(models.BPE())
+        self.tokenizer.normalizer = normalizers.NFKC()
+        self.tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+        self.trainer = trainers.BpeTrainer(vocab_size=self.vocab_size, special_tokens=["[PAD]","[UNK]","[CLS]","[SEP]"])
+        self._is_trained = False
+
+    def train_from_iterator(self, iterator: Iterator[str]):
+        print("[Tokenizer] Treinando BPE (pode demorar)...")
+        self.tokenizer.train_from_iterator(iterator, trainer=self.trainer)
+        self.tokenizer.save(self.path_out)
+        self._is_trained = True
+        print(f"[Tokenizer] Salvo em {self.path_out}")
+
+    def load(self):
+        if os.path.exists(self.path_out):
+            self.tokenizer = Tokenizer.from_file(self.path_out)
+            self._is_trained = True
+            print("[Tokenizer] Carregado.")
+        else:
+            raise FileNotFoundError("Tokenizer não encontrado.")
+
+    def encode_ids(self, text: str, max_length: int = DEFAULT_MAX_SEQ) -> List[int]:
+        ids = self.tokenizer.encode(text).ids
+        return ids[:max_length] if len(ids) > max_length else ids
+
+    def pad_truncate(self, ids: List[int], max_length: int = DEFAULT_MAX_SEQ) -> List[int]:
+        if len(ids) >= max_length:
+            return ids[:max_length]
+        pad_id = self.tokenizer.token_to_id("[PAD]") if "[PAD]" in self.tokenizer.get_vocab() else 0
+        return ids + [pad_id] * (max_length - len(ids))
+
+    def vocab_size(self):
+        return len(self.tokenizer.get_vocab())
+
+# ----------------------------
+# Helpers streaming (mantêm chamadas HF)
+# ----------------------------
+def text_stream_iterator(hf_id:str, config_name: Optional[str]=None, field_candidates: List[str]=["text","article","content"]):
+    try:
+        if config_name:
+            ds = load_dataset(hf_id, config_name, split="train", streaming=True)
+        else:
+            ds = load_dataset(hf_id, split="train", streaming=True)
+    except Exception as e:
+        print(f"[Dataset] Não foi possível abrir {hf_id}: {e}")
+        return iter([])
+    def gen():
+        for ex in ds:
+            if isinstance(ex, dict):
+                for k in field_candidates:
+                    if k in ex and isinstance(ex[k], str):
+                        yield ex[k]; break
+            elif isinstance(ex, str):
+                yield ex
+    return gen()
+
+def image_dataset_iterator(hf_id:str):
+    try:
+        ds = load_dataset(hf_id, split="train")
+    except Exception as e:
+        print(f"[Dataset] Imagem {hf_id} inacessível: {e}")
+        return iter([])
+    def gen():
+        for ex in ds:
+            img = None
+            if isinstance(ex, dict):
+                if "image" in ex: img = ex["image"]
+                elif "img" in ex: img = ex["img"]
+            if img is not None:
+                caption = ex.get("caption","") if isinstance(ex, dict) else ""
+                yield img, caption
+    return gen()
+
+def audio_dataset_iterator(hf_id:str, config_name:Optional[str]=None):
+    try:
+        if config_name:
+            ds = load_dataset(hf_id, config_name, split="train", streaming=True)
+        else:
+            ds = load_dataset(hf_id, split="train", streaming=True)
+    except Exception as e:
+        print(f"[Dataset] Áudio {hf_id} inacessível: {e}")
+        return iter([])
+    def gen():
+        for ex in ds:
+            if isinstance(ex, dict) and "audio" in ex:
+                yield ex["audio"], ex.get("sentence", "") or ex.get("text", "")
+    return gen()
+
+# ----------------------------
+# Vision encoder (compact, usado para embeddings de imagem)
+# ----------------------------
+class VisionEncoder(nn.Module):
+    def __init__(self, embed_dim:int):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 32, 3, 2, 1), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, 2, 1), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1,1)),
+            nn.Flatten()
+        )
+        self.fc = nn.Linear(64, embed_dim)
+
+    def forward(self, img_tensor):
+        feat = self.conv(img_tensor)
+        return self.fc(feat)
+
+# ----------------------------
+# Audio encoder para long clips: chunk -> pool
+# ----------------------------
+class ChunkAudioEncoder(nn.Module):
+    """
+    Processa áudio longo por chunks (e.g. 30s) e agrega embeddings.
+    Recebe waveform [batch, T] mono float.
+    Retorna [batch, embed_dim].
+    """
+    def __init__(self, embed_dim:int, sample_rate:int=16000, n_mels:int=80, chunk_seconds:float=30.0):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.n_mels = n_mels
+        self.chunk_samples = int(chunk_seconds * sample_rate)
+        self.melspec = torchaudio.transforms.MelSpectrogram(sample_rate=sample_rate, n_mels=n_mels)
+        self.chunk_cnn = nn.Sequential(
+            nn.Conv1d(n_mels, 128, 3, 2, 1), nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1), nn.Flatten()
+        )
+        self.fc = nn.Linear(128, embed_dim)
+        # aggregator transformer (leve)
+        self.agg_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=4, dim_feedforward=embed_dim*2)
+
+    def forward(self, wave: torch.Tensor):
+        # wave: [batch, T]
+        device = wave.device
+        B, T = wave.shape
+        chunk_embs = []
+        for start in range(0, T, self.chunk_samples):
+            seg = wave[:, start:start+self.chunk_samples]
+            if seg.shape[1] == 0: break
+            if seg.shape[1] < self.chunk_samples:
+                pad = torch.zeros(B, self.chunk_samples - seg.shape[1], device=device)
+                seg = torch.cat([seg, pad], dim=1)
+            mel = self.melspec(seg)  # [batch, n_mels, frames]
+            emb = self.chunk_cnn(mel)  # [batch, C]
+            emb = self.fc(emb)         # [batch, embed]
+            chunk_embs.append(emb.unsqueeze(0))
+        if len(chunk_embs) == 0:
+            return torch.zeros(B, self.fc.out_features, device=device)
+        seq = torch.cat(chunk_embs, dim=0)   # [num_chunks, B, embed]
+        seq = self.agg_layer(seq)            # transformer encoder expects [seq, B, embed]
+        pooled = seq.mean(dim=0)             # [B, embed]
+        return pooled
+
+# ----------------------------
+# TRANSFORMER PRIMITIVES (compact)
+# ----------------------------
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, embed_dim:int, num_heads:int, dropout:float=0.0):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.qkv = nn.Linear(embed_dim, 3*embed_dim, bias=False)
+        self.out = nn.Linear(embed_dim, embed_dim)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, mask:Optional[torch.Tensor]=None):
+        seq, bsz, _ = x.size()
+        qkv = self.qkv(x).view(seq, bsz, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.permute(1,2,0,3); k = k.permute(1,2,0,3); v = v.permute(1,2,0,3)
+        scores = torch.matmul(q, k.transpose(-2,-1)) / math.sqrt(self.head_dim)
+        if mask is not None: scores = scores.masked_fill(mask==0, float("-inf"))
+        att = torch.softmax(scores, dim=-1)
+        out = torch.matmul(att, v)
+        out = out.permute(2,0,1,3).contiguous().view(seq, bsz, self.embed_dim)
+        return self.drop(self.out(out))
+
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_dim:int, num_heads:int, ffn_dim:int, dropout=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = MultiHeadSelfAttention(embed_dim, num_heads, dropout)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.ff = nn.Sequential(nn.Linear(embed_dim, ffn_dim), nn.GELU(), nn.Linear(ffn_dim, embed_dim))
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, mask:Optional[torch.Tensor]=None):
+        r = x
+        x = self.norm1(x)
+        x = self.attn(x, mask)
+        x = r + self.drop(x)
+        r = x
+        x = self.norm2(x)
+        x = self.ff(x)
+        return r + self.drop(x)
+
+# ----------------------------
+# ThoughtModule (raciocínio longo configurável)
+# ----------------------------
+class ThoughtModule(nn.Module):
+    def __init__(self, embed_dim:int, thought_minutes:float=9.0, token_rate:float=1.0, n_layers:int=2, n_heads:int=8):
+        super().__init__()
+        # heurística: steps = minutes * 60 * token_rate
+        self.n_steps = max(8, int(thought_minutes * 60 * token_rate))
+        self.start_tokens = nn.Parameter(torch.randn(self.n_steps, 1, embed_dim))
+        self.layers = nn.ModuleList([TransformerBlock(embed_dim, n_heads, embed_dim*2) for _ in range(n_layers)])
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, context: torch.Tensor):
+        seq_len, bsz, embed = context.size()
+        thoughts = self.start_tokens.expand(-1, bsz, -1)   # [n_steps, bsz, embed]
+        combined = torch.cat([context, thoughts], dim=0)
+        for layer in self.layers:
+            combined = layer(combined)
+        return self.norm(combined[-self.n_steps:])
+
+# ----------------------------
+# ONModel (compact multimodal fusion)
+# ----------------------------
+class ONModel(nn.Module):
+    def __init__(self, vocab_size:int, embed_dim:int=DEFAULT_EMBED, num_layers:int=DEFAULT_LAYERS, num_heads:int=DEFAULT_HEADS, max_seq:int=DEFAULT_MAX_SEQ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        self.max_seq = max_seq
+        self.token_emb = nn.Embedding(vocab_size, embed_dim)
+        self.pos_emb = nn.Parameter(torch.randn(max_seq, 1, embed_dim))
+        self.layers = nn.ModuleList([TransformerBlock(embed_dim, num_heads, embed_dim*4) for _ in range(num_layers)])
+        self.thought = ThoughtModule(embed_dim)
+        self.final_ln = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, vocab_size)
+        # adapters
+        self.vision_adapter = nn.Linear(embed_dim, embed_dim)
+        self.audio_adapter = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, input_ids: torch.LongTensor, vision_emb: Optional[torch.Tensor]=None, audio_emb: Optional[torch.Tensor]=None):
+        bsz, seq = input_ids.size()
+        x = self.token_emb(input_ids).transpose(0,1)    # [seq, bsz, embed]
+        x = x + self.pos_emb[:seq,:,:].to(x.device)
+        # optional prepend modality tokens
+        prefix = []
+        if vision_emb is not None:
+            v = self.vision_adapter(vision_emb).unsqueeze(0)
+            prefix.append(v)
+        if audio_emb is not None:
+            a = self.audio_adapter(audio_emb).unsqueeze(0)
+            prefix.append(a)
+        if prefix:
+            pref = torch.cat(prefix, dim=0)
+            x = torch.cat([pref, x], dim=0)
+        for layer in self.layers:
+            x = layer(x)
+        thought_repr = self.thought(x)
+        x = torch.cat([x, thought_repr], dim=0)
+        x = self.final_ln(x)
+        # return logits for token positions (skip possible prefix)
+        token_slice = x[-seq:,:,:].transpose(0,1)  # [bsz, seq, embed]
+        logits = self.head(token_slice)
+        return logits
+
+# ----------------------------
+# VAE (encoder/decoder) - compact, trainable
+# ----------------------------
+class ConvEncoder(nn.Module):
+    def __init__(self, in_ch=3, z_dim=512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, 64, 4, 2, 1), nn.ReLU(),   # 1/2
+            nn.Conv2d(64, 128, 4, 2, 1), nn.ReLU(),    # 1/4
+            nn.Conv2d(128, 256, 4, 2, 1), nn.ReLU(),   # 1/8
+            nn.AdaptiveAvgPool2d((4,4)),
+            nn.Flatten(),
+            nn.Linear(256*4*4, z_dim*2)  # mu, logvar
+        )
+
+    def forward(self, x):
+        stats = self.net(x)
+        mu, logvar = stats.chunk(2, dim=1)
+        return mu, logvar
+
+class ConvDecoder(nn.Module):
+    def __init__(self, out_ch=3, z_dim=512):
+        super().__init__()
+        self.fc = nn.Linear(z_dim, 256*4*4)
+        self.net = nn.Sequential(
+            nn.Unflatten(1, (256,4,4)),
+            nn.ConvTranspose2d(256, 128, 4, 2, 1), nn.ReLU(),  # 8x8
+            nn.ConvTranspose2d(128, 64, 4, 2, 1), nn.ReLU(),   # 16x16
+            nn.ConvTranspose2d(64, out_ch, 4, 2, 1), nn.Sigmoid()  # 32x32 (example)
+        )
+
+    def forward(self, z):
+        x = self.fc(z)
+        x = self.net(x)
+        return x
+
+class VAE(nn.Module):
+    def __init__(self, img_channels=3, z_dim=512):
+        super().__init__()
+        self.encoder = ConvEncoder(in_ch=img_channels, z_dim=z_dim)
+        self.decoder = ConvDecoder(out_ch=img_channels, z_dim=z_dim)
+
+    def reparameterize(self, mu, logvar):
+        std = (0.5 * logvar).exp()
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def encode(self, x):
+        mu, logvar = self.encoder(x)
+        z = self.reparameterize(mu, logvar)
+        return z, mu, logvar
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def forward(self, x):
+        z, mu, logvar = self.encode(x)
+        recon = self.decode(z)
+        return recon, mu, logvar
+
+# ----------------------------
+# Simple UNet-like denoiser (skeleton)
+# ----------------------------
+class SimpleUNet(nn.Module):
+    def __init__(self, latent_dim=512):
+        super().__init__()
+        # a very small MLP UNet-ish for latents (placeholder)
+        self.down = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim*2), nn.GELU(),
+            nn.Linear(latent_dim*2, latent_dim)
+        )
+        self.time_embed = nn.Sequential(nn.Linear(1, latent_dim), nn.ReLU())
+        self.out = nn.Sequential(nn.Linear(latent_dim, latent_dim), nn.Tanh())
+
+    def forward(self, z, t):
+        # z: [B, latent_dim], t: scalar or [B,1]
+        te = self.time_embed(t.unsqueeze(-1).float())
+        h = self.down(z)
+        h = h + te
+        return self.out(h)
+
+# ----------------------------
+# Diffusion helpers (DDPM simple)
+# ----------------------------
+def linear_beta_schedule(timesteps, beta_start=1e-4, beta_end=0.02):
+    return torch.linspace(beta_start, beta_end, timesteps)
+
+class Diffusion:
+    def __init__(self, model: nn.Module, timesteps: int = 1000, device=DEVICE):
+        self.model = model
+        self.timesteps = timesteps
+        self.device = device
+        betas = linear_beta_schedule(timesteps).to(device)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        self.register_buffer = {}
+        self.betas = betas
+        self.alphas = alphas
+        self.alphas_cumprod = alphas_cumprod
+        self.sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1 - alphas_cumprod)
+
+    def q_sample(self, x_start, t, noise=None):
+        # x_start: [B, D]; t: tensor int timesteps index
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        sqrt_acp = self.sqrt_alphas_cumprod[t].unsqueeze(-1)
+        sqrt_om = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(-1)
+        return sqrt_acp * x_start + sqrt_om * noise
+
+    def p_losses(self, x_start, t):
+        # add noise
+        noise = torch.randn_like(x_start)
+        x_noisy = self.q_sample(x_start, t, noise=noise)
+        t_tensor = t.float() / float(self.timesteps)
+        pred = self.model(x_noisy, t_tensor)
+        return F.mse_loss(pred, noise)
+
+    @torch.no_grad()
+    def sample(self, shape, device, steps=None):
+        steps = steps or self.timesteps
+        x = torch.randn(shape, device=device)
+        for i in reversed(range(steps)):
+            t = torch.tensor([i], device=device)
+            t_norm = t.float() / float(self.timesteps)
+            pred_noise = self.model(x, t_norm)
+            beta = self.betas[i]
+            alpha = self.alphas[i]
+            alpha_cum = self.alphas_cumprod[i]
+            # simple DDPM step (not optimized)
+            if i > 0:
+                noise = torch.randn_like(x)
+            else:
+                noise = torch.zeros_like(x)
+            x = (1 / math.sqrt(alpha)) * (x - (beta / math.sqrt(1 - alpha_cum)) * pred_noise) + math.sqrt(beta) * noise
+        return x
+
+# ----------------------------
+# Image tiled generator helpers
+# ----------------------------
+class TiledGenerator:
+    def __init__(self, vae: VAE, unet: SimpleUNet, tile_size:int=1024, overlap:int=64, device=DEVICE):
+        self.vae = vae
+        self.unet = unet
+        self.tile_size = tile_size
+        self.overlap = overlap
+        self.device = device
+
+    def tile_coords(self, W:int, H:int):
+        stride = self.tile_size - self.overlap
+        xs = list(range(0, max(1, W - self.overlap), stride))
+        ys = list(range(0, max(1, H - self.overlap), stride))
+        for y in ys:
+            for x in xs:
+                w = min(self.tile_size, W - x)
+                h = min(self.tile_size, H - y)
+                yield x, y, w, h
+
+    def generate_tile(self, prompt, W, H, x, y, w, h, diffusion: Diffusion, steps=200):
+        # placeholder: unconditional latent sampling for tile of size (w,h) -> produce image tile
+        # we assume VAE expects e.g. 32x32 outputs for decoder; for large resolution you'd use a latent U-Net
+        latent_shape = (1, 512)  # latent_dim matching VAE z_dim
+        z = diffusion.sample(latent_shape, device=self.device, steps=steps)
+        recon = self.vae.decode(z)
+        # recon is a small image (e.g. 32x32) -> upsample to tile size
+        recon_img = F.interpolate(recon, size=(h,w), mode="bilinear", align_corners=False)
+        # convert to PIL
+        arr = (recon_img.clamp(0,1).cpu().squeeze(0).permute(1,2,0).numpy() * 255).astype('uint8')
+        return Image.fromarray(arr)
+
+    def generate_gigapixel(self, prompt, W, H, diffusion: Diffusion, steps=200):
+        canvas = Image.new("RGB", (W, H))
+        for x,y,w,h in self.tile_coords(W,H):
+            tile = self.generate_tile(prompt, W, H, x, y, w, h, diffusion, steps=steps)
+            canvas.paste(tile, (x,y))
+        return canvas
+
+# ----------------------------
+# Collate helpers
+# ----------------------------
+image_transform = transforms.Compose([transforms.Resize((224,224)), transforms.ToTensor()])
+
+def collate_texts(tokenizer: ONTokenizerWrapper, texts: List[str], max_len:int=DEFAULT_MAX_SEQ):
+    ids = [tokenizer.encode_ids(t, max_length=max_len) for t in texts]
+    ids = [tokenizer.pad_truncate(i, max_length=max_len) for i in ids]
+    return torch.tensor(ids, dtype=torch.long)
+
+# ----------------------------
+# Treino: integra VAE + Diffusion opcionalmente
+# ----------------------------
+def train_real(args):
+    # 1) tokenizer
+    tk = ONTokenizerWrapper(vocab_size=args.vocab_size, path_out=args.tokenizer_path)
+    if os.path.exists(args.tokenizer_path):
+        tk.load()
+    else:
+        def combined_iter():
+            for ds in args.text_datasets:
+                for s in text_stream_iterator(ds):
+                    yield s
+        tk.train_from_iterator(combined_iter())
+
+    # 2) dataset iterators (streaming)
+    text_iters = {ds: text_stream_iterator(ds) for ds in args.text_datasets}
+    image_iters = {ds: image_dataset_iterator(ds) for ds in args.image_datasets}
+    audio_iters = {ds: audio_dataset_iterator(ds) for ds in args.audio_datasets}
+
+    # 3) modelo + encoders
+    vocab_size = len(tk.tokenizer.get_vocab())
+    model = ONModel(vocab_size=vocab_size, embed_dim=args.embed_dim, num_layers=args.layers, num_heads=args.heads, max_seq=args.max_seq).to(args.device)
+    vision_enc = VisionEncoder(args.embed_dim).to(args.device)
+    audio_enc = ChunkAudioEncoder(args.embed_dim, chunk_seconds=args.audio_chunk_seconds).to(args.device)
+
+    # VAE + UNet + Diffusion (instanciar se necessário)
+    vae = VAE(img_channels=3, z_dim=args.vae_z_dim).to(args.device)
+    unet = SimpleUNet(latent_dim=args.vae_z_dim).to(args.device)
+    diffusion = Diffusion(unet, timesteps=args.diffusion_steps, device=args.device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer_vae = torch.optim.AdamW(vae.parameters(), lr=args.lr)
+    optimizer_unet = torch.optim.AdamW(unet.parameters(), lr=args.lr)
+
+    # training loop
+    steps = 0
+    print("[TRAIN] Iniciando loop de treino (esqueleto + VAE/diffusion).")
+    for epoch in range(args.epochs):
+        print(f"[TRAIN] Época {epoch+1}/{args.epochs}")
+        for ds_name, iterator in text_iters.items():
+            print(f"  Dataset text: {ds_name}")
+            batch_texts = []
+            for i, txt in enumerate(iterator):
+                if not isinstance(txt, str): continue
+                batch_texts.append(txt)
+                if len(batch_texts) == args.batch_size:
+                    input_ids = collate_texts(tk, batch_texts, max_len=args.max_seq).to(args.device)
+
+                    # sample random image/audio (se disponível)
+                    vision_emb = None
+                    audio_emb = None
+
+                    for img_ds, img_it in image_iters.items():
+                        try:
+                            img, caption = next(img_it)
+                            if isinstance(img, dict) and "path" in img:
+                                img = Image.open(img["path"]).convert("RGB")
+                            if isinstance(img, Image.Image):
+                                t = image_transform(img).unsqueeze(0).to(args.device)
+                                vision_emb = vision_enc(t)  # [1,embed]
+                            break
+                        except StopIteration:
+                            continue
+                        except Exception:
+                            continue
+
+                    for a_ds, a_it in audio_iters.items():
+                        try:
+                            aud, meta = next(a_it)
+                            if isinstance(aud, dict) and "array" in aud:
+                                arr = torch.tensor(aud["array"]).float().unsqueeze(0).to(args.device)  # [1, samples]
+                                audio_emb = audio_enc(arr)  # chunked encoder expects waveform
+                            break
+                        except StopIteration:
+                            continue
+                        except Exception:
+                            continue
+
+                    # forward ONModel
+                    logits = model(input_ids, vision_emb=vision_emb, audio_emb=audio_emb)
+                    labels = input_ids
+                    ignore_idx = tk.tokenizer.token_to_id("[PAD]") if "[PAD]" in tk.tokenizer.get_vocab() else -100
+                    loss_f = nn.CrossEntropyLoss(ignore_index=ignore_idx)
+                    loss = loss_f(logits.view(-1, logits.size(-1)), labels.view(-1))
+                    optimizer.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
+
+                    # --- opcional: treinar VAE + diffusion em imagens amostradas (pequeno batch) ---
+                    if vision_emb is not None and args.train_vae_diffusion:
+                        # quick VAE recon loss on small image patch
+                        # prepare image patch (resize small)
+                        img_tensor = image_transform(img).unsqueeze(0).to(args.device)  # [1, C, H, W]
+                        recon, mu, logvar = vae(img_tensor)
+                        rec_loss = F.mse_loss(recon, img_tensor) + 1e-6 * torch.mean(torch.exp(logvar) + mu**2 - logvar)
+                        optimizer_vae.zero_grad(); rec_loss.backward(); optimizer_vae.step()
+
+                        # diffusion training on latent z
+                        with torch.no_grad():
+                            z, mu_z, logvar_z = vae.encode(img_tensor)
+                        # sample random t
+                        t_idx = torch.randint(0, diffusion.timesteps, (z.shape[0],), device=args.device)
+                        diff_loss = diffusion.p_losses(z, t_idx)
+                        optimizer_unet.zero_grad(); diff_loss.backward(); optimizer_unet.step()
+
+                    steps += 1
+                    if steps % args.log_every == 0:
+                        print(f"    Step {steps} loss: {loss.item():.4f}")
+
+                    batch_texts = []
+                if i > args.max_examples_per_dataset:
+                    break
+
+        # checkpoint (modelo + vae + unet)
+        ckpt = os.path.join(args.checkpoint_dir, f"on_epoch{epoch+1}.pt")
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
+        torch.save({
+            "model": model.state_dict(),
+            "optim": optimizer.state_dict(),
+            "vae": vae.state_dict(),
+            "opt_vae": optimizer_vae.state_dict(),
+            "unet": unet.state_dict(),
+            "opt_unet": optimizer_unet.state_dict(),
+        }, ckpt)
+        print(f"[TRAIN] Checkpoint salvo: {ckpt}")
+
+    print("[TRAIN] Loop finalizado.")
+
+# ----------------------------
+# CLI
+# ----------------------------
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--vocab_size", type=int, default=50000)
+    p.add_argument("--max_seq", type=int, default=DEFAULT_MAX_SEQ)
+    p.add_argument("--embed_dim", type=int, default=DEFAULT_EMBED)
+    p.add_argument("--layers", type=int, default=DEFAULT_LAYERS)
+    p.add_argument("--heads", type=int, default=DEFAULT_HEADS)
+    p.add_argument("--batch_size", type=int, default=DEFAULT_BATCH)
+    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--device", type=str, default=str(DEVICE))
+    p.add_argument("--tokenizer_path", type=str, default="on_tokenizer.json")
+    p.add_argument("--checkpoint_dir", type=str, default=CHECKPOINT_DIR)
+    p.add_argument("--log_every", type=int, default=10)
+    p.add_argument("--max_examples_per_dataset", type=int, default=200)
+    p.add_argument("--text_datasets", nargs="+", default=DATASET_IDS_TEXT)
+    p.add_argument("--image_datasets", nargs="+", default=DATASET_IDS_IMAGE)
+    p.add_argument("--audio_datasets", nargs="+", default=DATASET_IDS_AUDIO)
+    p.add_argument("--audio_chunk_seconds", type=float, default=30.0, help="tamanho (s) do chunk de áudio para encoder longo")
+    p.add_argument("--vae_z_dim", type=int, default=512, help="dimensão latente do VAE")
+    p.add_argument("--diffusion_steps", type=int, default=200, help="timesteps do DDPM (treino/sampling)")
+    p.add_argument("--train_vae_diffusion", action="store_true", help="se setado, treinar VAE+diffusion durante loop")
+    return p.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+    # set device env
+    args.device = torch.device(args.device)
+    torch.cuda.set_device(args.device) if "cuda" in str(args.device) else None
+    train_real(args)
